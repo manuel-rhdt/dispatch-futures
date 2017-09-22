@@ -1,0 +1,14 @@
+[package]
+name = "dispatch-futures"
+version = "0.1.0"
+authors = ["Manuel Reinhardt <manuel.rhdt@gmail.com>"]
+
+[dependencies]
+dispatch = "0.1.2"
+futures = "0.1.14"
+stash = "0.1.3"
+tokio-timer = "0.1"
+
+[dev-dependencies]
+reqwest = "0.6.2"
+pbr = "1.0.0"
