@@ -1,18 +1,22 @@
 extern crate dispatch;
 extern crate futures;
-extern crate stash;
 extern crate tokio_timer;
+#[macro_use]
+extern crate log;
+
+mod task;
+mod notify_mutex;
 
 use futures::{Async, Future};
 use futures::future::{Executor, ExecuteError, IntoFuture};
 use futures::executor;
-use futures::executor::{Spawn, Notify};
 use futures::sync::oneshot::{spawn, spawn_fn, SpawnHandle, Execute};
-use stash::Stash;
 
-use std::mem;
-use std::sync::{Arc, Weak, Mutex};
-use std::ptr;
+use std::{ptr, mem};
+use std::cell::UnsafeCell;
+use std::sync::{Arc, Weak};
+
+use task::Task;
 
 type BoxFuture = Box<Future<Item = (), Error = ()> + Send + 'static>;
 
@@ -34,20 +38,6 @@ impl<T: Send, E> Future for DispatchFuture<T, E> {
     }
 }
 
-struct Task {
-    future: Spawn<BoxFuture>,
-}
-
-pub struct Notifier {
-    queue: DispatchQueue,
-}
-
-impl executor::Notify for Notifier {
-    fn notify(&self, id: usize) {
-        self.queue.send_work(id);
-    }
-}
-
 #[derive(Clone)]
 pub struct Queue {
     inner: Arc<Inner>,
@@ -55,86 +45,99 @@ pub struct Queue {
 
 pub struct Inner {
     pub queue: dispatch::Queue,
+    notifier: UnsafeCell<Arc<Notifier>>,
 }
+
+impl Inner {
+    pub fn notifier_ref(&self) -> &Arc<Notifier> {
+        unsafe { &*self.notifier.get() }
+    }
+}
+
+unsafe impl Sync for Inner {}
 
 impl Queue {
-    fn submit(&self, task: SpawnedTask) {
-        // submit work
+    fn submit(&self, task: Task) {
+        trace!("Queue::submit({:?})", task);
+        // test if we should poll the future
+        let mut future = match task.mutex.notify() {
+            // we may queue up the future to be polled
+            Ok(future) => future,
+            // The future is already being polled or has already completed.
+            // In this case there is nothing to do and we just return.
+            Err(_) => {
+                trace!("Already scheduled to poll or already completed.");
+                return
+            },
+        };
         let inner = self.inner.clone();
         self.inner.queue.async(move || {
-            // Get the notifier.
-            let notify = Arc::new(Notfer {
-                inner: Arc::downgrade(&inner),
-            });
-            task.run(&notify)
+            let notifier = inner.notifier_ref();
+            unsafe {
+                // notify the mutex that we are about to poll
+                task.mutex.start_poll();
+            }
+
+            // loop until no more repolling is needed
+            loop {
+                trace!("Poll: started");
+                match future.poll_future_notify(notifier, task.notify_id()) {
+                    Ok(Async::Ready(())) |
+                    Err(()) => {
+                        trace!("Poll: completed");
+                        unsafe { task.mutex.complete() };
+                        break;
+                    }
+                    Ok(Async::NotReady) => {
+                        trace!("Poll: not ready");
+                        match unsafe { task.mutex.wait(future) } {
+                            // no repolling needed
+                            Ok(()) => break,
+                            // poll the future again
+                            Err(repoll_future) => future = repoll_future,
+                        }
+                    }
+                }
+            }
         });
     }
 }
 
-pub struct TaskInner {
-    future: Option<Spawn<BoxFuture>>,
-}
-
-pub struct SpawnedTask {
-    ptr: *mut TaskInner,
-}
-
-impl SpawnedTask {
-    pub fn new<T: Future<Item = (), Error = ()> + Send + 'static>(f: T) -> SpawnedTask {
-        let inner = Box::new(TaskInner {
-            future: Some(executor::spawn(Box::new(f))),
-        });
-
-        SpawnedTask { ptr: Box::into_raw(inner) }
-    }
-
-    /// Transmute a u64 to a Task
-    pub unsafe fn from_notify_id(unpark_id: usize) -> SpawnedTask {
-        mem::transmute(unpark_id)
-    }
-
-    /// Transmute a u64 to a task ref
-    pub unsafe fn from_notify_id_ref<'a>(unpark_id: &'a usize) -> &'a SpawnedTask {
-        mem::transmute(unpark_id)
-    }
-
-    pub fn run(&self, notify: &Arc<Notfer>) {
-        let _ = self.inner_mut().future.as_mut().unwrap()
-            .poll_future_notify(notify, self.ptr as usize);
-    }
-
-    #[inline]
-    fn inner(&self) -> &TaskInner {
-        unsafe { &*self.ptr }
-    }
-
-    #[inline]
-    fn inner_mut(&self) -> &mut TaskInner {
-        unsafe { &mut *self.ptr }
-    }
-}
-
-impl Clone for SpawnedTask {
-    fn clone(&self) -> Self {
-        SpawnedTask {
-            ptr: self.ptr
-        }
-    }
-}
-
-unsafe impl Send for SpawnedTask {}
-
-pub struct Notfer {
+pub struct Notifier {
     inner: Weak<Inner>,
 }
 
-impl executor::Notify for Notfer {
+impl executor::Notify for Notifier {
     fn notify(&self, id: usize) {
-        let task = unsafe { SpawnedTask::from_notify_id_ref(&id) };
+        trace!("notifiy id: {:?}", id);
         let queue = Queue {
-            inner: self.inner.upgrade().unwrap()
+            inner: self.inner.upgrade().unwrap_or_else(|| {
+                panic!(
+                    "Task with id={:?} was notified while Queue was already freed!",
+                    id
+                )
+            }),
         };
+        let task = unsafe { Task::from_notify_id_ref(&id) };
         queue.submit(task.clone());
+    }
+
+    fn clone_id(&self, id: usize) -> usize {
+        trace!("clone_id: {:?}", id);
+
+        unsafe {
+            let handle = Task::from_notify_id_ref(&id);
+            mem::forget(handle.clone());
+        }
+
+        id
+    }
+
+    fn drop_id(&self, id: usize) {
+        trace!("drop_id: {:?}", id);
+        unsafe {
+            let _ = Task::from_notify_id(id);
+        }
     }
 }
 
@@ -143,68 +146,22 @@ where
     F: Future<Item = (), Error = ()> + Send + Sync + 'static,
 {
     fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
-        let task = SpawnedTask::new(future);
+        trace!("Queue::execute");
+        let task = Task::new(future);
         self.submit(task);
         Ok(())
     }
 }
 
-#[derive(Clone)]
-pub struct DispatchQueue {
-    queue: dispatch::Queue,
-    tasks: Arc<Mutex<Stash<Option<Task>>>>,
-    notify: Arc<Notifier>,
-}
-
-unsafe impl Sync for DispatchQueue {}
-
-impl DispatchQueue {
-    pub fn with_queue(q: dispatch::Queue) -> Self {
-        let mut queue = DispatchQueue {
-            queue: q,
-            tasks: Arc::new(Mutex::new(Stash::new())),
-            // leave notify temporarily uninitialized
-            notify: unsafe { Arc::new(::std::mem::zeroed()) },
-        };
-
-        let notifier = Notifier { queue: queue.clone() };
-
-        // Write into uninitialized memory without dropping.
-        let raw_ptr = Arc::into_raw(queue.notify) as *mut _;
-        unsafe { ptr::write(raw_ptr, notifier) };
-        unsafe { queue.notify = Arc::from_raw(raw_ptr) };
-
-        queue
-    }
-
-    fn send_work(&self, index: usize) {
-        let slot = self.tasks
-            .lock()
-            .expect("Could not lock mutex")
-            .get_mut(index)
-            .map(|slot| slot.take());
-
-        let mut task = match slot {
-            Some(Some(task)) => task,
-            _ => {
-                // Slot empty, task already in progress.
-                return;
-            }
-        };
-        let tasks = self.tasks.clone();
-        let notify = self.notify.clone();
-
-        self.queue.async(move || {
-            let res = task.future.poll_future_notify(&notify, index);
-            match res {
-                Ok(Async::NotReady) => {
-                    tasks.lock().expect("Could not lock mutex")[index] = Some(task);
-                }
-                Ok(Async::Ready(())) | Err(()) => {
-                    tasks.lock().expect("Could not lock mutex").take(index).unwrap();
-                }
-            }
+impl Queue {
+    pub fn new() -> Queue {
+        let inner = Arc::new(Inner {
+            queue: dispatch::Queue::global(dispatch::QueuePriority::Default),
+            notifier: UnsafeCell::new(Arc::new(Notifier { inner: Weak::new() })),
         });
+        let notifier = Arc::new(Notifier { inner: Arc::downgrade(&inner) });
+        unsafe { ptr::replace(inner.notifier.get(), notifier) };
+        Queue { inner: inner }
     }
 
     pub fn spawn<F>(&self, future: F) -> DispatchFuture<F::Item, F::Error>
@@ -215,6 +172,8 @@ impl DispatchQueue {
         DispatchFuture { inner: spawn(future, self) }
     }
 
+    /// Immediately submits the provided closure to the queue. Returns a Future representing
+    /// the finished result after executing the closure. 
     pub fn spawn_fn<F, R>(&self, f: F) -> DispatchFuture<R::Item, R::Error>
     where
         F: FnOnce() -> R + Send,
@@ -222,34 +181,6 @@ impl DispatchQueue {
         Self: Executor<Execute<futures::Lazy<F, R>>>,
     {
         DispatchFuture { inner: spawn_fn(f, self) }
-    }
-}
-
-impl<F> Executor<F> for DispatchQueue
-where
-    F: Future<Item = (), Error = ()> + Send + 'static,
-{
-    fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
-        let spawned_future = executor::spawn(Box::new(future) as BoxFuture);
-
-        let index = {
-            let mut tasks = self.tasks.lock().expect("Could not lock mutex");
-
-            let index = tasks.put(None);
-
-            tasks[index] = Some(Task { future: spawned_future });
-
-            index
-        };
-
-        self.send_work(index);
-        Ok(())
-    }
-}
-
-impl Default for DispatchQueue {
-    fn default() -> DispatchQueue {
-        DispatchQueue::with_queue(dispatch::Queue::global(dispatch::QueuePriority::Default))
     }
 }
 
@@ -264,7 +195,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let executor = DispatchQueue::default();
+        let executor = Queue::new();
         let a = executor.spawn_fn(|| {
             for i in 0..10 {
                 println!("counting {:?}", i);
