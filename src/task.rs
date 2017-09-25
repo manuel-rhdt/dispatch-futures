@@ -33,6 +33,7 @@ impl Task {
         Task { mutex: Arc::new(mutex) }
     }
 
+    /// Transmute a task to a usize.
     pub fn notify_id(&self) -> usize {
         unsafe {
             let this: Task = ptr::read(self);
@@ -40,12 +41,12 @@ impl Task {
         }
     }
 
-    /// Transmute a u64 to a Task reference
+    /// Transmute a usize reference to a Task reference
     pub unsafe fn from_notify_id_ref(notify_id: &usize) -> &Task {
         mem::transmute(notify_id)
     }
 
-    /// Transmute a u64 to a Task
+    /// Transmute a usize to a Task
     pub unsafe fn from_notify_id(notify_id: usize) -> Task {
         mem::transmute(notify_id)
     }

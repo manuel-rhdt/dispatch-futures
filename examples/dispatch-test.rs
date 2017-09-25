@@ -30,7 +30,7 @@ use std::io::prelude::*;
 fn main() {
     env_logger::init().unwrap();
 
-    let executor = DispatchQueue::default();
+    let executor = QueueExecutor::default();
 
     let (mut tx, rx) = channel(8);
     let a = executor.spawn_fn(move || {
