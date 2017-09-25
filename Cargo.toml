@@ -2,14 +2,15 @@
 name = "dispatch-futures"
 version = "0.1.0"
 authors = ["Manuel Reinhardt <manuel.rhdt@gmail.com>"]
+license = "Apache-2.0"
 
 [dependencies]
 dispatch = "0.1.2"
 futures = "0.1.14"
-tokio-timer = "0.1"
 log = "0.3"
 
 [dev-dependencies]
 reqwest = "0.6.2"
 pbr = "1.0.0"
 env_logger = "0.3"
+tokio-timer = "0.1"
