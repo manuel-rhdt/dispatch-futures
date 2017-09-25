@@ -56,8 +56,10 @@ pub struct Queue {
     inner: Arc<Inner>,
 }
 
-pub struct Inner {
-    pub queue: dispatch::Queue,
+struct Inner {
+    queue: dispatch::Queue,
+    // UnsafeCell is needed here so we can construct a reference cycle (Notifier contains
+    // a Weak<Inner>).
     notifier: UnsafeCell<Arc<Notifier>>,
 }
 
@@ -80,8 +82,8 @@ impl Queue {
             // In this case there is nothing to do and we just return.
             Err(_) => {
                 trace!("Already scheduled to poll or already completed.");
-                return
-            },
+                return;
+            }
         };
         let inner = self.inner.clone();
         self.inner.queue.async(move || {
@@ -186,7 +188,7 @@ impl Queue {
     }
 
     /// Immediately submits the provided closure to the queue. Returns a Future representing
-    /// the finished result after executing the closure. 
+    /// the finished result after executing the closure.
     pub fn spawn_fn<F, R>(&self, f: F) -> DispatchFuture<R::Item, R::Error>
     where
         F: FnOnce() -> R + Send,
