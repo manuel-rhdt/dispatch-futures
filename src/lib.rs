@@ -1,11 +1,11 @@
 //    Copyright 2017 Manuel Reinhardt
-// 
+//
 //    Licensed under the Apache License, Version 2.0 (the "License");
 //    you may not use this file except in compliance with the License.
 //    You may obtain a copy of the License at
-// 
+//
 //        http://www.apache.org/licenses/LICENSE-2.0
-// 
+//
 //    Unless required by applicable law or agreed to in writing, software
 //    distributed under the License is distributed on an "AS IS" BASIS,
 //    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -33,6 +33,39 @@ use task::Task;
 
 type BoxFuture = Box<Future<Item = (), Error = ()> + Send + 'static>;
 
+/// A future acting as a proxy to the original future passed to `Queue::spawn`.
+///
+/// A `DispachFuture` represents a calculation performed on a dispatch queue.
+/// If the `DispatchFuture` is dropped before it completed its execution on the gcd queue will tried
+/// to be canceled. If you want to have the future execute in the background and discarding its
+/// result see the `forget()` method.
+///
+/// Examples
+/// --------
+///
+/// You can `.wait()` on a `DispatchFuture` to block until the computation finishes:
+///
+/// ```
+/// # extern crate dispatch_futures;
+/// # extern crate futures;
+///
+/// use dispatch_futures::DispatchQueue;
+/// use futures::future::Future;
+///
+/// # fn main() {
+/// let executor = DispatchQueue::default();
+/// let future = executor.spawn_fn(|| {
+/// #   let result = 0;
+///     // long computation...
+///     Ok(result) as Result<_, ()>
+/// });
+///
+/// // This will not return until the execution of the closure has completed
+/// // (probably on another thread)
+/// future.wait().unwrap();
+/// # }
+/// ```
+///
 pub struct DispatchFuture<T, E> {
     inner: SpawnHandle<T, E>,
 }
@@ -51,8 +84,9 @@ impl<T: Send, E> Future for DispatchFuture<T, E> {
     }
 }
 
+/// A Wrapper of a dispatch queue that can execute futures.
 #[derive(Clone)]
-pub struct Queue {
+pub struct DispatchQueue {
     inner: Arc<Inner>,
 }
 
@@ -71,7 +105,7 @@ impl Inner {
 
 unsafe impl Sync for Inner {}
 
-impl Queue {
+impl DispatchQueue {
     fn submit(&self, task: Task) {
         trace!("Queue::submit({:?})", task);
         // test if we should poll the future
@@ -118,14 +152,14 @@ impl Queue {
     }
 }
 
-pub struct Notifier {
+struct Notifier {
     inner: Weak<Inner>,
 }
 
 impl executor::Notify for Notifier {
     fn notify(&self, id: usize) {
         trace!("notifiy id: {:?}", id);
-        let queue = Queue {
+        let queue = DispatchQueue {
             inner: self.inner.upgrade().unwrap_or_else(|| {
                 panic!(
                     "Task with id={:?} was notified while Queue was already freed!",
@@ -156,7 +190,7 @@ impl executor::Notify for Notifier {
     }
 }
 
-impl<F> Executor<F> for Queue
+impl<F> Executor<F> for DispatchQueue
 where
     F: Future<Item = (), Error = ()> + Send + Sync + 'static,
 {
@@ -168,17 +202,20 @@ where
     }
 }
 
-impl Queue {
-    pub fn new() -> Queue {
+impl DispatchQueue {
+    /// Create a new `DispatchQueue` from `queue`.
+    pub fn new(queue: dispatch::Queue) -> DispatchQueue {
         let inner = Arc::new(Inner {
-            queue: dispatch::Queue::global(dispatch::QueuePriority::Default),
+            queue: queue,
             notifier: UnsafeCell::new(Arc::new(Notifier { inner: Weak::new() })),
         });
         let notifier = Arc::new(Notifier { inner: Arc::downgrade(&inner) });
         unsafe { ptr::replace(inner.notifier.get(), notifier) };
-        Queue { inner: inner }
+        DispatchQueue { inner: inner }
     }
 
+    /// Immediately submits the provided future to the queue. Returns a Future representing
+    /// the finished result after the provided future has completed.
     pub fn spawn<F>(&self, future: F) -> DispatchFuture<F::Item, F::Error>
     where
         F: Future,
@@ -189,6 +226,8 @@ impl Queue {
 
     /// Immediately submits the provided closure to the queue. Returns a Future representing
     /// the finished result after executing the closure.
+    ///
+    /// This is identical to `executor.spawn(lazy(f))`.
     pub fn spawn_fn<F, R>(&self, f: F) -> DispatchFuture<R::Item, R::Error>
     where
         F: FnOnce() -> R + Send,
@@ -196,6 +235,12 @@ impl Queue {
         Self: Executor<Execute<futures::Lazy<F, R>>>,
     {
         DispatchFuture { inner: spawn_fn(f, self) }
+    }
+}
+
+impl Default for DispatchQueue {
+    fn default() -> Self {
+        DispatchQueue::new(dispatch::Queue::global(dispatch::QueuePriority::Default))
     }
 }
 
@@ -211,7 +256,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let executor = Queue::new();
+        let executor = DispatchQueue::default();
         let a = executor.spawn_fn(|| {
             for i in 0..10 {
                 println!("counting {:?}", i);
