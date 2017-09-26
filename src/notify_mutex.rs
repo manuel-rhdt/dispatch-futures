@@ -1,4 +1,9 @@
-//    This file was copied with small modifications from futures-rs.
+//    This file was copied with small modifications from futures-rs (original name: unpark_mutex.rs).
+//    Original Authors:
+//      Aaron Turon
+//      Alex Crichton
+//
+//    Copyright 2017 Manuel Reinhardt
 // 
 //    Licensed under the Apache License, Version 2.0 (the "License");
 //    you may not use this file except in compliance with the License.
