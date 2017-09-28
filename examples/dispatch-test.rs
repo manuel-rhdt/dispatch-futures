@@ -12,6 +12,8 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+// This example downloads from a URL to memory and asynchronously while displaying a progress bar on
+// the main thread.
 extern crate futures_libdispatch;
 extern crate futures;
 extern crate reqwest;
@@ -26,18 +28,26 @@ use pbr::{ProgressBar, Units};
 
 use std::io;
 use std::io::prelude::*;
+use std::env;
 
 fn main() {
     env_logger::init().unwrap();
+    let mut args = env::args();
+    if args.len() != 2 {
+        panic!("Needs exactly one argument specifying the URL from which to download.");
+    }
+    let url = args.nth(1).unwrap();
 
     let executor = QueueExecutor::default();
 
     let (mut tx, rx) = channel(8);
     let a = executor.spawn_fn(move || {
-        let mut resp = reqwest::get("http://ipv4.download.thinkbroadband.com/50MB.zip").unwrap();
+        let mut resp = reqwest::get(&url).unwrap();
         assert!(resp.status().is_success());
 
-        let &ContentLength(total_length) = resp.headers().get().unwrap();
+        let &ContentLength(total_length) = resp.headers().get().expect(
+            "Missing content length. Try another URL.",
+        );
 
         let mut buffer = [0u8; 128 * 1024];
         let mut vector = Vec::new();
@@ -72,5 +82,4 @@ fn main() {
 
     result.unwrap();
     pb.finish_print("done");
-    // println!("result {:?}", result);
 }
