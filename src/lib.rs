@@ -30,6 +30,37 @@
 //! Examples
 //! --------
 //!
+//! Run two functions in parallel on a concurrent queue and wait for them to finish:
+//!
+//! ```
+//! extern crate futures_libdispatch;
+//! extern crate futures;
+//!
+//! use futures_libdispatch::QueueExecutor;
+//! use futures::prelude::*;
+//!
+//! #[derive(Debug)]
+//! struct Error;
+//!
+//! fn expensive_calculation(input: f64) -> Result<f64, Error> {
+//!     // perform expensive work
+//! #    Ok(input)
+//! }
+//!
+//! fn main() {
+//!     // creates a executor with the default concurrent queue
+//!     let executor = QueueExecutor::default();
+//!
+//!     let first_calculation = executor.spawn_fn(|| expensive_calculation(1.0));
+//!     let second_calculation = executor.spawn_fn(|| expensive_calculation(2.0));
+//!
+//!     // combine futures
+//!     let combined_calculations = first_calculation.join(second_calculation);
+//!     let (result1, result2) = combined_calculations.wait().unwrap();
+//!     # assert_eq!(result1, 1.0);
+//!     # assert_eq!(result2, 2.0);
+//! }
+//! ```
 //!
 
 extern crate dispatch;
@@ -64,13 +95,16 @@ type BoxFuture = Box<Future<Item = (), Error = ()> + Send + 'static>;
 /// Examples
 /// --------
 ///
-/// You can `.wait()` on a `EnqueuedFuture` to block until the computation finishes:
-/// TODO
+/// You can `.wait()` on a `EnqueuedFuture` to block until the computation finishes.
+/// You have to be careful however that if your code is currently executing in a serial queue you
+/// shouldn't call `.wait()` on a future spawned on the same serial queue as this will deadlock the
+/// queue.
+///
 /// ```
-/// # extern crate dispatch_futures;
+/// # extern crate futures_libdispatch;
 /// # extern crate futures;
 ///
-/// use dispatch_futures::QueueExecutor;
+/// use futures_libdispatch::QueueExecutor;
 /// use futures::Future;
 ///
 /// # fn main() {
@@ -98,7 +132,7 @@ impl<T, E> EnqueuedFuture<T, E> {
     ///
     /// The future will be polled until it has completed and its result
     /// will be ignored regardless if the future execution was successful or not. This is usually
-    /// useful for logging and other unimportant tasks that need to be scheduled ansynchronously.
+    /// useful for logging and other unimportant tasks that need to be scheduled asynchronously.
     pub fn forget(self) {
         self.inner.forget()
     }
@@ -124,7 +158,8 @@ impl<T: Send, E> Future for EnqueuedFuture<T, E> {
 /// automatically benefits from all available CPU cores.
 ///
 /// After creation of the `QueueExecutor` one can still access the original queue using
-/// `QueueExecutor`'s deref implementation.
+/// `QueueExecutor`'s deref implementation. This means you can still queue up work on the Queue
+/// using the API from the `dispatch` crate.
 ///
 /// Examples
 /// --------
@@ -132,7 +167,7 @@ impl<T: Send, E> Future for EnqueuedFuture<T, E> {
 /// Create an executor from the global parallel queue with default priority
 ///
 /// ```
-/// use dispatch_futures::QueueExecutor;
+/// use futures_libdispatch::QueueExecutor;
 /// let executor = QueueExecutor::default();
 /// ```
 ///

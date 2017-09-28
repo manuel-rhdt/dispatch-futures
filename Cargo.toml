@@ -1,5 +1,5 @@
 [package]
-name = "dispatch-futures"
+name = "futures_libdispatch"
 version = "0.1.0"
 authors = ["Manuel Reinhardt <manuel.rhdt@gmail.com>"]
 license = "Apache-2.0"

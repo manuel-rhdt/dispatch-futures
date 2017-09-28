@@ -12,13 +12,13 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
-extern crate dispatch_futures;
+extern crate futures_libdispatch;
 extern crate futures;
 extern crate reqwest;
 extern crate pbr;
 extern crate env_logger;
 
-use dispatch_futures::*;
+use futures_libdispatch::*;
 use futures::sync::mpsc::channel;
 use futures::{Future, Stream, Sink};
 use reqwest::header::ContentLength;
