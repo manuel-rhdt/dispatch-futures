@@ -62,14 +62,14 @@ fn main() {
             vector.extend_from_slice(&buffer[0..len]);
             match tx.send((vector.len(), total_length)).wait() {
                 Ok(new_tx) => tx = new_tx,
-                Err(_) => panic!("Oh no!"),
+                Err(_) => unreachable!("Oh no!"),
             }
         }
 
         Ok(vector)
     });
 
-    let mut pb = ProgressBar::new(10000);
+    let mut pb = ProgressBar::new(10_000);
     pb.set_units(Units::Bytes);
 
     let result = rx.for_each(|(veclen, total)| {

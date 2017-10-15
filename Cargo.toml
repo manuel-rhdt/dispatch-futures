@@ -5,12 +5,16 @@ authors = ["Manuel Reinhardt <manuel.rhdt@gmail.com>"]
 license = "Apache-2.0"
 
 [dependencies]
-dispatch = "0.1.2"
+dispatch = "0.1.3"
 futures = "0.1.14"
 log = "0.3"
 
 [dev-dependencies]
-reqwest = "0.6.2"
-pbr = "1.0.0"
+reqwest = "0.6.*"
+pbr = "1.0"
 env_logger = "0.3"
-tokio-timer = "0.1"
+tokio-timer = "0.1.*"
+
+[patch.crates-io]
+
+dispatch = { path = "rust-dispatch" }

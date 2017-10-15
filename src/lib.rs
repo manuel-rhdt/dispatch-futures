@@ -63,27 +63,22 @@
 //! ```
 //!
 
+#![feature(alloc_system)]
 extern crate dispatch;
 extern crate futures;
 #[macro_use]
 extern crate log;
 
-mod task;
-mod notify_mutex;
-
 use futures::{Async, Future};
 use futures::future::{Executor, ExecuteError, IntoFuture};
-use futures::executor;
-use futures::sync::oneshot::{spawn, spawn_fn, SpawnHandle, Execute};
+use futures::executor::{self, Notify};
+use futures::sync::oneshot::{spawn, spawn_fn, SpawnHandle};
 
-use std::{ptr, mem, fmt};
+use std::fmt;
 use std::cell::UnsafeCell;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::sync::atomic::*;
 use std::ops::Deref;
-
-use task::Task;
-
-type BoxFuture = Box<Future<Item = (), Error = ()> + Send + 'static>;
 
 /// A future acting as a proxy to the original future passed to `QueueExecutor::spawn`.
 ///
@@ -117,7 +112,8 @@ type BoxFuture = Box<Future<Item = (), Error = ()> + Send + 'static>;
 ///
 /// // This will not return until the execution of the closure has completed
 /// // (on another thread)
-/// future.wait().unwrap();
+/// let result = future.wait().unwrap();
+/// # assert_eq!(result, 0);
 /// # }
 /// ```
 ///
@@ -139,7 +135,7 @@ impl<T, E> EnqueuedFuture<T, E> {
 
     /// Returns the queue onto which the contained future was enqueued.
     pub fn queue(&self) -> QueueExecutor {
-        QueueExecutor { inner: self.queue_inner.clone() }
+        QueueExecutor { inner: Arc::clone(&self.queue_inner) }
     }
 }
 
@@ -185,79 +181,212 @@ pub struct QueueExecutor {
 
 struct Inner {
     queue: dispatch::Queue,
-    // UnsafeCell is needed here so we can construct a reference cycle (Notifier contains
-    // a Weak<Inner>). Unsafe access is only needed during construction of a `QueueExecutor`.
-    notifier: UnsafeCell<Arc<Notifier>>,
 }
-
-impl Inner {
-    fn notifier_ref(&self) -> &Arc<Notifier> {
-        unsafe { &*self.notifier.get() }
-    }
-}
-
-// The thread-unsafe mutation of the contained `UnsafeCell` is only performed during initialization
-// of a new `QueueExecutor`. Thus the following impl is safe.
-unsafe impl Sync for Inner {}
 
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Queue")
-            .field("label", &self.queue.label())
-            .finish()
+        f.debug_struct("Queue").field("label", &self.queue.label()).finish()
     }
 }
 
-#[derive(Debug)]
-struct Notifier {
-    inner: Weak<Inner>,
+#[derive(Default, Debug)]
+struct ScopedFuture<F, SourceT> {
+    spawned_fut: Option<executor::Spawn<F>>,
+    notify: Option<Arc<Notifier<F, SourceT>>>,
 }
 
-impl executor::Notify for Notifier {
-    fn notify(&self, id: usize) {
-        trace!("notifiy id: {:?}", id);
+impl<F> Future for ScopedFuture<F, dispatch::source::DataOr> where F: Future + Send + 'static {
+    type Item = F::Item;
+    type Error = F::Error;
 
-        // Construct the dispatch queue from the pointer to `inner`...
-        let queue = QueueExecutor {
-            inner: self.inner.upgrade().unwrap_or_else(|| {
-                panic!(
-                    "Task with id={:?} was notified while QueueExecutor was already freed!",
-                    id
-                )
-            }),
+    fn poll(&mut self) -> futures::Poll<F::Item, F::Error> {
+        // safe because no mutable references of notifier exist
+        let notifier = self.notify.as_ref().expect("No notifier!");
+
+        // safe because we know we are the only thread accessing spawned_fut
+        let mut future = self.spawned_fut.take().expect("ScopedFuture: polled when future was already complete!");
+
+        match future.poll_future_notify(notifier, 0) {
+            result @ Ok(Async::Ready(_)) | result @ Err(_) => {
+                trace!("Poll: completed");
+                // don't allow any more notifications
+                notifier.source.get().map(|source| source.cancel());
+                result
+            }
+            Ok(Async::NotReady) => {
+                trace!("Poll: not ready");
+                // put future back
+                self.spawned_fut = Some(future);
+                Ok(Async::NotReady)
+            }
+        }
+    }
+}
+
+// state machine can only progress downwards in states.
+const UNPOLLED: usize = 0;
+const POLLED: usize = 1;
+const UPDATING: usize = 2;
+const UPDATING_POLLED: usize = 3;
+const COMPLETE: usize = 4;
+
+pub struct NotifyLock<Inner> {
+    state: AtomicUsize,
+    inner: UnsafeCell<Option<Inner>>
+}
+
+impl<Inner> NotifyLock<Inner> {
+    fn new() -> Self {
+        NotifyLock {
+            state: AtomicUsize::new(UNPOLLED),
+            inner: UnsafeCell::new(None)
+        }
+    }
+
+    fn get(&self) -> Option<&Inner> {
+        if self.state.load(Ordering::Relaxed) == COMPLETE {
+            unsafe { (&*self.inner.get()).as_ref() }
+        } else {
+            None
+        }
+    }
+
+    fn poll(&self) -> Option<&Inner> {
+        loop {
+            match self.state.load(Ordering::Relaxed) {
+                UNPOLLED => if self.state.compare_and_swap(UNPOLLED, POLLED, Ordering::SeqCst) == UNPOLLED {
+                    break;
+                },
+                UPDATING => if self.state.compare_and_swap(UPDATING, UPDATING_POLLED, Ordering::SeqCst) == UPDATING {
+                    break;
+                },
+                POLLED | UPDATING_POLLED => break,
+                COMPLETE => return unsafe { (&*self.inner.get()).as_ref() },
+                _ => unreachable!(),
+            }
+        }
+        None
+    }
+
+    /// Stores a value in the lock than can be read by subsequent calls to `get`.
+    /// Returns true if lock was polled before `set` was called.
+    ///
+    /// Panics
+    /// ------
+    /// Panics if called more than once for a lock.
+
+    fn set(&self, value: Inner) -> bool {
+        let should_repoll = match self.state.swap(UPDATING, Ordering::Acquire) {
+            UPDATING | UPDATING_POLLED | COMPLETE => panic!("NotifyLock: cannot set value more than once!"),
+            POLLED => true,
+            UNPOLLED => false,
+            _ => unreachable!(),
         };
+        unsafe { *self.inner.get() = Some(value) };
+        match self.state.swap(COMPLETE, Ordering::Release) {
+            UPDATING => should_repoll,
+            UPDATING_POLLED => true,
+            _ => unreachable!(),
+        }
+    }
+}
 
-        // ... and submit the task to be polled again.
-        let task = unsafe { Task::from_notify_id_ref(&id) };
-        queue.submit(task.clone());
+unsafe impl<T: Send> Send for NotifyLock<T> {}
+
+unsafe impl<T> Sync for NotifyLock<T> {}
+
+pub struct Notifier<F, SourceT> {
+    future: UnsafeCell<ScopedFuture<F, SourceT>>,
+    source: NotifyLock<dispatch::Source<SourceT>>,
+}
+
+impl<F, S> Notifier<F, S> {
+    fn new(future: F) -> Arc<Notifier<F, S>> {
+        let spawned = executor::spawn(future);
+        let scoped = ScopedFuture { spawned_fut: Some(spawned), notify: Default::default() };
+        let notifier = Notifier {
+            future: UnsafeCell::new(scoped),
+            source: NotifyLock::new(),
+        };
+        let notifier = Arc::new(notifier);
+
+        // Build a reference cycle. Safe because during construction nobody else has access.
+        unsafe { (&mut *notifier.future.get()).notify = Some(Arc::clone(&notifier)) };
+        notifier
     }
 
-    fn clone_id(&self, id: usize) -> usize {
-        trace!("clone_id: {:?}", id);
-        unsafe {
-            let handle = Task::from_notify_id_ref(&id);
-            mem::forget(handle.clone());
-        }
-
-        id
+    // No other references to `self` are allowed.
+    unsafe fn terminate(&self) {
+        trace!("terminate notifier");
+        let _ = (&mut *self.future.get()).notify.take();
+        let _ = (&mut *self.source.inner.get()).take();
     }
+}
 
-    fn drop_id(&self, id: usize) {
-        trace!("drop_id: {:?}", id);
-        unsafe {
-            let _ = Task::from_notify_id(id);
-        }
+impl<F, S> fmt::Debug for Notifier<F, S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Notifier").field("state", &self.source.state).finish()
+    }
+}
+
+impl<F> executor::Notify for Notifier<F, dispatch::source::DataOr> where F: Send {
+    fn notify(&self, _: usize) {
+        trace!("notify");
+        self.source.poll().map(|source| source.merge_data(1));
+    }
+}
+
+unsafe impl<F, S> Send for Notifier<F, S> where F: Send, S: Send {}
+
+unsafe impl<F, S> Sync for Notifier<F, S> where S: Sync {}
+
+impl<F, S> Drop for Notifier<F, S> {
+    fn drop(&mut self) {
+        trace!("dropped notifier");
     }
 }
 
 impl<F> Executor<F> for QueueExecutor
-where
-    F: Future<Item = (), Error = ()> + Send + Sync + 'static,
-{
+    where F: Future<Item=(), Error=()> + Send + 'static, {
     fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
         trace!("QueueExecutor::execute");
-        let task = Task::new(future);
-        self.submit(task);
+
+        let task = Notifier::new(future);
+
+        let target_queue = self.inner.queue.clone();
+
+        self.async(move || {
+            // safe mutable access, because task is not yet shared
+            match unsafe { (&mut *task.future.get()).poll() } {
+                Ok(Async::Ready(())) | Err(()) => {
+                    // drop the notifier (mutable access is safe because we never shared the task)
+                    unsafe { task.terminate() };
+                }
+                Ok(Async::NotReady) => {
+                    trace!("Create dispatch source");
+
+                    // We have to create a dispatch source now
+                    let mut source = dispatch::SourceBuilder::new(dispatch::source::DataOr, &target_queue).unwrap();
+
+                    let shared_task = Arc::clone(&task);
+                    // Access to future in the event handler is safe, because the source ensures
+                    // that only one handler can run at any given time.
+                    source.event_handler(move |_| match unsafe { (&mut *shared_task.future.get()).poll() } {
+                        Ok(Async::Ready(())) | Err(()) => {
+                            unsafe { shared_task.terminate() };
+                        }
+                        Ok(Async::NotReady) => {}
+                    });
+
+
+                    let should_renotify = task.source.set(source.resume());
+                    if should_renotify {
+                        task.notify(0);
+                    }
+                }
+            }
+        });
+
         Ok(())
     }
 }
@@ -268,63 +397,17 @@ impl QueueExecutor {
         queue.into()
     }
 
-    fn submit(&self, task: Task) {
-        trace!("QueueExecutor::submit({:?})", task);
-        // test if we should poll the future
-        let mut future = match task.mutex.notify() {
-            // Ok means we may queue up the future and poll it.
-            Ok(future) => future,
-            // Err means the future is already being polled or has already completed.
-            // In this case there is nothing to do and we just return.
-            Err(_) => {
-                trace!("Already scheduled to poll or already completed.");
-                return;
-            }
-        };
-        let inner = self.inner.clone();
-        self.inner.queue.async(move || {
-            let notifier = inner.notifier_ref();
-            unsafe {
-                // notify the mutex that we are about to poll
-                task.mutex.start_poll();
-            }
-
-            // loop until no more repolling is needed
-            loop {
-                trace!("Poll: started");
-                match future.poll_future_notify(notifier, task.notify_id()) {
-                    Ok(Async::Ready(())) |
-                    Err(()) => {
-                        trace!("Poll: completed");
-                        unsafe { task.mutex.complete() };
-                        break;
-                    }
-                    Ok(Async::NotReady) => {
-                        trace!("Poll: not ready");
-                        match unsafe { task.mutex.wait(future) } {
-                            // no repolling needed
-                            Ok(()) => break,
-                            // Poll the future again because it was notified during the poll.
-                            Err(repoll_future) => future = repoll_future,
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     /// Immediately submits the provided future to the queue which will then be driven to
     /// completion.
     ///
     /// Returns a Future representing the finished result after the provided future has completed.
     pub fn spawn<F>(&self, future: F) -> EnqueuedFuture<F::Item, F::Error>
-    where
-        F: Future,
-        Self: Executor<Execute<F>>,
-    {
+        where F: Future + Send + 'static,
+              F::Item: Send + 'static,
+              F::Error: Send + 'static, {
         EnqueuedFuture {
             inner: spawn(future, self),
-            queue_inner: self.inner.clone(),
+            queue_inner: Arc::clone(&self.inner),
         }
     }
 
@@ -339,20 +422,21 @@ impl QueueExecutor {
     /// create a future in the closure you can just return a `Result` which has a trivial
     /// implementation of `IntoFuture`.
     pub fn spawn_fn<F, R>(&self, f: F) -> EnqueuedFuture<R::Item, R::Error>
-    where
-        F: FnOnce() -> R + Send,
-        R: IntoFuture,
-        Self: Executor<Execute<futures::Lazy<F, R>>>,
-    {
+        where F: FnOnce() -> R + Send + 'static,
+              R: IntoFuture + 'static,
+              R::Future: Send + 'static,
+              R::Item: Send + 'static,
+              R::Error: Send + 'static {
         EnqueuedFuture {
             inner: spawn_fn(f, self),
-            queue_inner: self.inner.clone(),
+            queue_inner: Arc::clone(&self.inner),
         }
     }
 }
 
 impl Default for QueueExecutor {
     /// Returns the global parallel queue with default priority.
+
     fn default() -> Self {
         dispatch::Queue::global(dispatch::QueuePriority::Default).into()
     }
@@ -361,11 +445,8 @@ impl Default for QueueExecutor {
 impl From<dispatch::Queue> for QueueExecutor {
     fn from(queue: dispatch::Queue) -> QueueExecutor {
         let inner = Arc::new(Inner {
-            queue: queue,
-            notifier: UnsafeCell::new(Arc::new(Notifier { inner: Weak::new() })),
+            queue,
         });
-        let notifier = Arc::new(Notifier { inner: Arc::downgrade(&inner) });
-        unsafe { ptr::replace(inner.notifier.get(), notifier) };
         QueueExecutor { inner: inner }
     }
 }
@@ -383,6 +464,7 @@ mod tests {
     use super::*;
 
     extern crate tokio_timer;
+
     use self::tokio_timer::*;
 
     use std::thread;
