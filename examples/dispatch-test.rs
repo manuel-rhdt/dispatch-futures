@@ -12,8 +12,9 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
-// This example downloads from a URL to memory and asynchronously while displaying a progress bar on
-// the main thread.
+//! This example downloads from a URL to memory and asynchronously while displaying a progress bar on
+//! the main thread.
+
 extern crate futures_libdispatch;
 extern crate futures;
 extern crate reqwest;

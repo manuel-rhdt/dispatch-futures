@@ -63,7 +63,6 @@
 //! ```
 //!
 
-#![feature(alloc_system)]
 extern crate dispatch;
 extern crate futures;
 #[macro_use]
