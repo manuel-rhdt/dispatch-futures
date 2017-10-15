@@ -75,7 +75,7 @@ use futures::sync::oneshot::{spawn, spawn_fn, SpawnHandle};
 
 use std::fmt;
 use std::cell::UnsafeCell;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::*;
 use std::ops::Deref;
 
@@ -191,7 +191,7 @@ impl fmt::Debug for Inner {
 #[derive(Default, Debug)]
 struct ScopedFuture<F, SourceT> {
     spawned_fut: Option<executor::Spawn<F>>,
-    notify: Option<Arc<Notifier<F, SourceT>>>,
+    notify: Weak<Notifier<F, SourceT>>,
 }
 
 impl<F> Future for ScopedFuture<F, dispatch::source::DataOr> where F: Future + Send + 'static {
@@ -200,12 +200,12 @@ impl<F> Future for ScopedFuture<F, dispatch::source::DataOr> where F: Future + S
 
     fn poll(&mut self) -> futures::Poll<F::Item, F::Error> {
         // safe because no mutable references of notifier exist
-        let notifier = self.notify.as_ref().expect("No notifier!");
+        let notifier = self.notify.upgrade().expect("No notifier!");
 
         // safe because we know we are the only thread accessing spawned_fut
         let mut future = self.spawned_fut.take().expect("ScopedFuture: polled when future was already complete!");
 
-        match future.poll_future_notify(notifier, 0) {
+        match future.poll_future_notify(&notifier, 0) {
             result @ Ok(Async::Ready(_)) | result @ Err(_) => {
                 trace!("Poll: completed");
                 // don't allow any more notifications
@@ -294,15 +294,21 @@ unsafe impl<T: Send> Send for NotifyLock<T> {}
 
 unsafe impl<T> Sync for NotifyLock<T> {}
 
+pub struct FutureAccessToken<F, S> {
+    notifier_ptr: *const Notifier<F, S>,
+}
+
+unsafe impl<F, S> Send for FutureAccessToken<F, S> {}
+
 pub struct Notifier<F, SourceT> {
     future: UnsafeCell<ScopedFuture<F, SourceT>>,
     source: NotifyLock<dispatch::Source<SourceT>>,
 }
 
 impl<F, S> Notifier<F, S> {
-    fn new(future: F) -> Arc<Notifier<F, S>> {
+    fn new(future: F) -> (Arc<Notifier<F, S>>, FutureAccessToken<F, S>) {
         let spawned = executor::spawn(future);
-        let scoped = ScopedFuture { spawned_fut: Some(spawned), notify: Default::default() };
+        let scoped = ScopedFuture { spawned_fut: Some(spawned), notify: Weak::new() };
         let notifier = Notifier {
             future: UnsafeCell::new(scoped),
             source: NotifyLock::new(),
@@ -310,15 +316,18 @@ impl<F, S> Notifier<F, S> {
         let notifier = Arc::new(notifier);
 
         // Build a reference cycle. Safe because during construction nobody else has access.
-        unsafe { (&mut *notifier.future.get()).notify = Some(Arc::clone(&notifier)) };
-        notifier
+        unsafe { (&mut *notifier.future.get()).notify = Arc::downgrade(&notifier) };
+
+        let token = FutureAccessToken { notifier_ptr: notifier.deref() };
+
+        (notifier, token)
     }
 
-    // No other references to `self` are allowed.
-    unsafe fn terminate(&self) {
-        trace!("terminate notifier");
-        let _ = (&mut *self.future.get()).notify.take();
-        let _ = (&mut *self.source.inner.get()).take();
+    fn future_mut(&self, access_token: &mut FutureAccessToken<F, S>) -> &mut ScopedFuture<F, S> {
+        if access_token.notifier_ptr != self {
+            panic!("Wrong acces token for future access!");
+        }
+        unsafe { &mut *self.future.get() }
     }
 }
 
@@ -350,33 +359,33 @@ impl<F> Executor<F> for QueueExecutor
     fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
         trace!("QueueExecutor::execute");
 
-        let task = Notifier::new(future);
+        let (task, mut token) = Notifier::new(future);
 
         let target_queue = self.inner.queue.clone();
 
         self.async(move || {
-            // safe mutable access, because task is not yet shared
-            match unsafe { (&mut *task.future.get()).poll() } {
-                Ok(Async::Ready(())) | Err(()) => {
-                    // drop the notifier (mutable access is safe because we never shared the task)
-                    unsafe { task.terminate() };
-                }
+            match task.future_mut(&mut token).poll() {
+                // We're done here.
+                Ok(Async::Ready(())) | Err(()) => {}
+
+                // Future is not ready and the task will get notified when it is ready to progress.
+                // We create a dispatch source that polls the future whenever appropriate.
                 Ok(Async::NotReady) => {
                     trace!("Create dispatch source");
 
-                    // We have to create a dispatch source now
                     let mut source = dispatch::SourceBuilder::new(dispatch::source::DataOr, &target_queue).unwrap();
 
-                    let shared_task = Arc::clone(&task);
-                    // Access to future in the event handler is safe, because the source ensures
+                    let mut shared_task = Some(Arc::clone(&task));
+
+                    // Access to future in the event handler is safe, because the dispatch source ensures
                     // that only one handler can run at any given time.
-                    source.event_handler(move |_| match unsafe { (&mut *shared_task.future.get()).poll() } {
+                    source.event_handler(move |_| match shared_task.as_ref().expect("running event_handler after future has already completed").future_mut(&mut token).poll() {
                         Ok(Async::Ready(())) | Err(()) => {
-                            unsafe { shared_task.terminate() };
+                            // Drop the reference to the task so it can be freed.
+                            let _ = shared_task.take();
                         }
                         Ok(Async::NotReady) => {}
                     });
-
 
                     let should_renotify = task.source.set(source.resume());
                     if should_renotify {
